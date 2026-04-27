@@ -1,0 +1,552 @@
+# SAMP Apps — Shared APK build pipeline (strict mode).
+#
+# This is a reusable workflow. The three project-type entry workflows
+# (react-native.yml, expo-managed.yml, expo-prebuild.yml) all `uses:`
+# this file with their own `project_type` value. Keeping the pipeline
+# in one place prevents the three entry workflows from drifting apart
+# while still satisfying the per-type-workflow contract — the entry
+# files are tiny, do nothing but route, and are independently
+# inspectable.
+#
+# Strict-mode contract
+#   The pipeline ingests untrusted user repositories. There is NO
+#   patching, NO file generation, NO shell fallback. The strict gate
+#   either ACCEPTS the repo (complete android/ + clean threat profile +
+#   valid wrapper) or REJECTS it with a per-reason diagnostic written
+#   to the user's job feed. Builds that pass the gate progress to
+#   bundle ⇒ pre-gradle health ⇒ gradle ⇒ sign ⇒ release.
+#
+# Pipeline shape (per project type)
+#   bare_rn        : clone → preflight → install → INSPECT → bundle …
+#   expo_managed   : clone → preflight → install → PREBUILD → INSPECT …
+#   expo_prebuild  : clone → preflight → install → INSPECT → bundle …
+#
+# Only `expo_managed` runs the prebuild step; the other two paths are
+# identical to each other (same commands, same gate). Splitting them
+# at the workflow level lets the user explicitly tag their submission
+# so the transparency report records what they meant.
+#
+# Operating contract
+#   • Every stage emits a "started" + terminal event to public.build_events
+#     (long stages also emit "info"/"progress" events).
+#   • The strict gate is the only stage allowed to declare a project
+#     error. Every other failure is reported as a system error.
+#   • Secrets (SUPABASE_*, GITHUB_TOKEN) are scoped per-step and never
+#     exposed to user-code-running steps (install / bundle / gradle).
+#   • Every message and file that crosses into Supabase or the public
+#     transparency bucket is filtered through pipeline/scripts/sanitize-log.sh.
+
+name: SAMP Apps · Shared build pipeline
+
+on:
+    workflow_call:
+        inputs:
+            job_id:
+                description: "Supabase build_jobs.id"
+                required: true
+                type: string
+            project_repo:
+                description: "Git URL of the user's project"
+                required: true
+                type: string
+            project_ref:
+                description: "Branch / tag / sha"
+                required: false
+                type: string
+                default: "main"
+            project_type:
+                description: "bare_rn | expo_managed | expo_prebuild"
+                required: true
+                type: string
+            user_id:
+                description: "Supabase users.id (for transparency report attribution)"
+                required: false
+                type: string
+                default: ""
+            supabase_url:
+                description: "Supabase project url"
+                required: true
+                type: string 
+            supabase_key:
+                description: "Supabase service role key"
+                required: true
+                type: string 
+
+permissions:
+    contents: write
+
+env:
+    USER_ID:      ${{ inputs.user_id }}
+    JOB_ID:       ${{ inputs.job_id }}
+    PROJECT_REPO: ${{ inputs.project_repo }}
+    PROJECT_REF:  ${{ inputs.project_ref }}
+    PROJECT_TYPE: ${{ inputs.project_type }}
+    
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with: { node-version: "20" }
+            - uses: actions/setup-java@v4
+              with: { distribution: temurin, java-version: "17" }
+            - uses: android-actions/setup-android@v3
+            - uses: gradle/actions/setup-gradle@v3
+              with: { gradle-version: "8.7" }
+
+            # ───── Helpers ───────────────────────────────────────────────
+            - name: Stage helpers (sanitised log_event, require_path)
+              shell: bash
+              env:
+                  SUPABASE_URL: ${{ inputs.supabase_url }}
+                  SUPABASE_KEY: ${{ inputs.supabase_key }}
+              run: |
+                  mkdir -p /tmp/sb /tmp/samp-stage-timings
+                  cat > /tmp/sb/env <<EOF
+                  SUPABASE_URL=$SUPABASE_URL
+                  SUPABASE_KEY=$SUPABASE_KEY
+                  EOF
+                  chmod 0600 /tmp/sb/env
+
+                  # Make the in-repo helpers executable.
+                  chmod +x pipeline/scripts/*.sh
+
+                  # log_event: filters every message+details through
+                  # sanitize-log.sh before posting to Supabase. Failure
+                  # of logging never fails the build.
+                  cat > /tmp/log_event.sh <<'BASH'
+                  #!/usr/bin/env bash
+                  set -uo pipefail
+                  [ -r /tmp/sb/env ] && . /tmp/sb/env
+                  [ -z "${SUPABASE_URL:-}" ] && exit 0
+                  STAGE="$1"; STATUS="$2"; MSG="$3"; DETAILS="${4:-null}"
+                  SAFE_MSG=$(printf '%s' "$MSG" | "$GITHUB_WORKSPACE/pipeline/scripts/sanitize-log.sh")
+                  SAFE_DETAILS=$(printf '%s' "$DETAILS" | "$GITHUB_WORKSPACE/pipeline/scripts/sanitize-log.sh")
+                  echo "$(date -u +%FT%TZ) $STAGE $STATUS" >> /tmp/samp-stage-timings/timeline.log
+                  jq -n --arg s "$STAGE" --arg st "$STATUS" --arg m "$SAFE_MSG" \
+                        --arg id "$JOB_ID" --argjson d "$SAFE_DETAILS" \
+                        '{p_job_id:$id, p_stage:$s, p_status:$st, p_message:$m, p_details:$d}' \
+                  | curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/jobs_log_event" \
+                      -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                      -H "Content-Type: application/json" --data-binary @- >/dev/null || true
+                  BASH
+                  chmod +x /tmp/log_event.sh
+
+                  cat > /tmp/require_path.sh <<'BASH'
+                  #!/usr/bin/env bash
+                  set -e
+                  KIND="$1"; P="$2"; LABEL="${3:-$P}"
+                  case "$KIND" in
+                      file) [ -f "$P" ] || { echo "::error::missing required file: $LABEL → $P"; exit 1; } ;;
+                      dir)  [ -d "$P" ] || { echo "::error::missing required directory: $LABEL → $P"; exit 1; } ;;
+                      *)    echo "require_path: bad kind '$KIND'"; exit 64 ;;
+                  esac
+                  echo "  ✓ $LABEL → $P"
+                  BASH
+                  chmod +x /tmp/require_path.sh
+
+            - name: Mark job running
+              env:
+                  SUPABASE_URL: ${{ inputs.supabase_url }}
+                  SUPABASE_KEY: ${{ inputs.supabase_key }}
+              run: |
+                  /tmp/log_event.sh "running" "started" "Build started ($PROJECT_TYPE)."
+                  curl -sS -X PATCH "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID" \
+                       -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                       -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+                       -d '{"status":"running","started_at":"'"$(date -u +%FT%TZ)"'","run_url":"'"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"'"}'
+
+            - name: Install pipeline deps
+              run: |
+                  /tmp/log_event.sh "pipeline_install" "started" "Installing build-pipeline deps."
+                  npm install --no-audit --no-fund --ignore-scripts
+                  /tmp/log_event.sh "pipeline_install" "succeeded" "Pipeline ready."
+
+            # ───── 1. URL allowlist + clone ──────────────────────────────
+            - name: Validate repository URL
+              shell: bash
+              run: |
+                  URL="$PROJECT_REPO"
+                  /tmp/log_event.sh "clone" "info" "Validating repo URL." \
+                      "$(jq -n --arg u "$URL" '{url:$u}')"
+                  case "$URL" in
+                      https://*) : ;;
+                      *) /tmp/log_event.sh "clone" "failed" "Only HTTPS Git URLs are accepted." \
+                             "$(jq -n --arg u "$URL" '{url:$u}')"
+                         echo "::error::Repository URL must use https:// (got '$URL')"
+                         exit 1 ;;
+                  esac
+                  if [ "${ALLOW_ANY_HOST:-0}" != "1" ]; then
+                      HOST=$(echo "$URL" | sed -E 's#https://([^/]+)/.*#\1#')
+                      case "$HOST" in
+                          github.com|gitlab.com|bitbucket.org|codeberg.org) : ;;
+                          *) /tmp/log_event.sh "clone" "failed" "Repository host '$HOST' is not in the default allowlist." \
+                                 "$(jq -n --arg h "$HOST" '{host:$h, hint:"Set ALLOW_ANY_HOST=1 to override."}')"
+                             echo "::error::Repository host '$HOST' is not in the allowlist."
+                             exit 1 ;;
+                      esac
+                  fi
+
+            - name: Clone user project
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "clone" "started" "Cloning $PROJECT_REPO @ $PROJECT_REF"
+                  mkdir -p workdir
+                  # Strip the GitHub Actions credential header that
+                  # actions/checkout@v4 attaches to ~/.gitconfig before
+                  # cloning anything user-supplied. Without this, a
+                  # cloned repository (or its submodules) could read
+                  # GITHUB_TOKEN out of the runner's git config.
+                  git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+                  git config --global --unset-all url.https://github.com/.insteadOf 2>/dev/null || true
+                  if ! git clone --depth 1 --no-tags --filter=blob:limit=50m \
+                         --branch "$PROJECT_REF" "$PROJECT_REPO" workdir/project 2>/tmp/clone.err; then
+                      ERR=$(head -c 1000 /tmp/clone.err)
+                      /tmp/log_event.sh "clone" "failed" "We couldn't clone your repository. Check that the URL and branch are correct and that the repository is public." \
+                          "$(jq -n --arg e "$ERR" '{stderr:$e}')"
+                      echo "::error::Clone failed"; exit 50
+                  fi
+                  /tmp/log_event.sh "clone" "succeeded" "Cloned." \
+                      "$(jq -n --arg ref "$PROJECT_REF" '{ref:$ref}')"
+
+            # ───── 2. Preflight: size cap, symlink escape, registry hijack ─
+            - name: Preflight cloned repo
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "preflight" "started" "Running security preflight on cloned repo."
+                  set +e
+                  pipeline/scripts/preflight-clone.sh workdir/project "${REPO_MAX_MB:-500}" "${REPO_MAX_FILE_MB:-100}" 2>&1 | tee /tmp/preflight.log
+                  RC=${PIPESTATUS[0]}
+                  set -e
+                  if [ $RC -ne 0 ]; then
+                      SAFE=$(pipeline/scripts/sanitize-log.sh < /tmp/preflight.log)
+                      /tmp/log_event.sh "preflight" "failed" "Repository preflight failed." \
+                          "$(jq -n --arg o "$SAFE" '{report:$o}')"
+                      exit 1
+                  fi
+                  /tmp/log_event.sh "preflight" "succeeded" "Repository preflight passed."
+
+            # ───── 3. Install user deps (lifecycle scripts disabled) ──────
+            - name: Install user project deps
+              working-directory: workdir/project
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "install" "started" "Installing user project deps (--ignore-scripts)."
+                  IGNORE="--ignore-scripts"
+                  if [ "${SAMP_ALLOW_INSTALL_SCRIPTS:-0}" = "1" ]; then
+                      IGNORE=""
+                      /tmp/log_event.sh "install" "info" "Lifecycle scripts ENABLED via SAMP_ALLOW_INSTALL_SCRIPTS=1."
+                  fi
+                  if   [ -f yarn.lock ];      then echo "[install] yarn detected"
+                                                   ../../pipeline/scripts/run-with-progress.sh install 30 -- yarn install --frozen-lockfile $IGNORE
+                  elif [ -f pnpm-lock.yaml ]; then echo "[install] pnpm detected"
+                                                   ../../pipeline/scripts/run-with-progress.sh install 30 -- npx -y pnpm@9 install --frozen-lockfile $IGNORE
+                  elif [ -f bun.lockb ];      then echo "[install] bun detected"
+                                                   ../../pipeline/scripts/run-with-progress.sh install 30 -- npx -y bun install --frozen-lockfile $IGNORE
+                  else                              echo "[install] npm fallback"
+                                                   ../../pipeline/scripts/run-with-progress.sh install 30 -- npm install --no-audit --no-fund $IGNORE
+                  fi
+                  /tmp/log_event.sh "install" "succeeded" "User project deps installed."
+
+            # ───── 3b. Expo prebuild (expo_managed only) ──────────────────
+            # Generates the android/ directory from the Expo config so
+            # the rest of the pipeline (inspect → bundle → gradle) sees
+            # a populated, strict-gate-acceptable project. We pass
+            # --no-install because user deps are already installed.
+            - name: Expo prebuild (managed projects only)
+              if: inputs.project_type == 'expo_managed'
+              working-directory: workdir/project
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "prebuild" "started" "Generating android/ via expo prebuild."
+                  set +e
+                  npx -y expo prebuild --platform android --no-install --clean 2>&1 | tee /tmp/prebuild.log
+                  RC=${PIPESTATUS[0]}
+                  set -e
+                  if [ $RC -ne 0 ]; then
+                      SAFE=$(../../pipeline/scripts/sanitize-log.sh < /tmp/prebuild.log)
+                      /tmp/log_event.sh "prebuild" "failed" "Expo prebuild did not complete. Check that your app.json is valid and that you are using a recent Expo SDK." \
+                          "$(jq -n --arg o "$SAFE" '{report:$o}')"
+                      exit $RC
+                  fi
+                  /tmp/log_event.sh "prebuild" "succeeded" "android/ directory generated by expo prebuild."
+
+            # ───── 4. INSPECT — facts + threat scan + strict gate ─────────
+            - name: Inspect, scan, and decide
+              id: inspect
+              shell: bash
+              env:
+                  SUPABASE_URL: ${{ inputs.supabase_url }}
+                  SUPABASE_KEY: ${{ inputs.supabase_key }}
+              run: |
+                  /tmp/log_event.sh "inspect" "started" "Inspecting facts, scanning for threats, deciding gate."
+                  set +e
+                  npx -y ts-node inspector/index.ts workdir/project workdir/project-spec.json
+                  RC=$?
+                  set -e
+                  echo "inspect_exit=$RC" >> "$GITHUB_OUTPUT"
+                  if [ $RC -eq 2 ]; then
+                      ACCEPTED=false
+                      ERR=$(jq -r '.primary_error.message // "Project did not pass the strict gate."' workdir/project-spec.json)
+                      REASONS=$(jq '{reasons: .gate.reasons, summary: .gate.summary}' workdir/project-spec.json)
+                      SAFE_REASONS=$(printf '%s' "$REASONS" | pipeline/scripts/sanitize-log.sh)
+                      /tmp/log_event.sh "inspect" "failed" "$ERR" "$SAFE_REASONS"
+                      curl -sS -X PATCH "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID" \
+                           -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                           -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+                           -d "$(jq -n --arg e "$ERR" --argjson d "$SAFE_REASONS" \
+                                '{status:"failed",finished_at:(now|todate),error_kind:"project",error_message:$e,error_details:$d,current_stage:"inspect"}')"
+                      echo "gate_accepted=false" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+                  if [ $RC -ne 0 ]; then
+                      /tmp/log_event.sh "inspect" "failed" "Something went wrong on our side while inspecting your project. Please try the build again in a few minutes."
+                      echo "gate_accepted=false" >> "$GITHUB_OUTPUT"
+                      exit $RC
+                  fi
+                  ANDROID_ROOT=$(jq -r '.gate.android_root' workdir/project-spec.json)
+                  echo "android_root=$ANDROID_ROOT" >> "$GITHUB_OUTPUT"
+                  echo "gate_accepted=true" >> "$GITHUB_OUTPUT"
+                  /tmp/log_event.sh "inspect" "succeeded" "Project accepted by strict gate." \
+                      "$(jq '{facts: .facts, summary: .gate.summary}' workdir/project-spec.json)"
+                  curl -sS -X PATCH "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID" \
+                       -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                       -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+                       -d "$(jq -n --argjson s "$(cat workdir/project-spec.json)" '{project_spec:$s,current_stage:"inspect"}')"
+
+            # ───── 5. Metro bundle ───────────────────────────────────────
+            - name: Bundle JS with Metro
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "bundle" "started" "Running Metro bundle."
+                  ANDROID_ROOT="${{ steps.inspect.outputs.android_root }}"
+                  pipeline/scripts/run-with-progress.sh bundle 30 -- \
+                      npx -y ts-node builder/metroBundler.ts workdir/project \
+                          --spec workdir/project-spec.json \
+                          --android-root "$ANDROID_ROOT" 2>&1 | tee /tmp/bundle-stream.log
+                  RC=${PIPESTATUS[0]}
+                  if [ $RC -ne 0 ]; then
+                      /tmp/log_event.sh "bundle" "failed" "We couldn't bundle your app's JavaScript. Please try the build again in a few minutes."
+                      exit $RC
+                  fi
+                  /tmp/log_event.sh "bundle" "succeeded" "JavaScript bundle prepared."
+
+            # ───── 6. Strict validator ───────────────────────────────────
+            - name: Validate android root post-bundle
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "validate" "started" "Re-validating android root after bundle."
+                  ANDROID_ROOT="${{ steps.inspect.outputs.android_root }}"
+                  npx -y ts-node validator/index.ts "$ANDROID_ROOT"
+                  /tmp/log_event.sh "validate" "succeeded" "Validator passed."
+
+            # ───── 7. Pre-Gradle health ──────────────────────────────────
+            - name: Pre-Gradle health
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "pre_gradle" "started" "Verifying Gradle launch prerequisites."
+                  ANDROID_ROOT="${{ steps.inspect.outputs.android_root }}"
+                  npx -y ts-node pipeline/preGradleHealth.ts "$ANDROID_ROOT" --out /tmp/pre-gradle.json
+                  /tmp/log_event.sh "pre_gradle" "succeeded" "Pre-Gradle health checks passed."
+
+            # ───── 8. Gradle assembleRelease ─────────────────────────────
+            - name: Gradle assembleRelease
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              shell: bash
+              run: |
+                  /tmp/log_event.sh "gradle" "started" "Running Gradle assembleRelease."
+                  ANDROID_ROOT="${{ steps.inspect.outputs.android_root }}"
+                  pipeline/scripts/run-gradle.sh "$ANDROID_ROOT" :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-stream.log
+                  RC=${PIPESTATUS[0]}
+                  if [ $RC -ne 0 ]; then
+                      /tmp/log_event.sh "gradle" "failed" "The Android build did not complete. Please try again in a few minutes."
+                      exit $RC
+                  fi
+                  /tmp/log_event.sh "gradle" "succeeded" "Android build complete."
+
+            # ───── 9. Sign APK ───────────────────────────────────────────
+            - name: Sign APK
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              working-directory: ${{ steps.inspect.outputs.android_root }}
+              run: |
+                  /tmp/log_event.sh "sign" "started" "Signing APK."
+                  KEYSTORE=$HOME/.android/debug.keystore
+                  if [ ! -f "$KEYSTORE" ]; then
+                      mkdir -p $HOME/.android
+                      keytool -genkeypair -v -keystore "$KEYSTORE" \
+                          -storepass android -alias androiddebugkey -keypass android \
+                          -keyalg RSA -keysize 2048 -validity 10000 \
+                          -dname "CN=SAMP Apps, OU=, O=, L=, S=, C=US"
+                  fi
+                  APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+                  BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
+                  $ANDROID_HOME/build-tools/$BT/apksigner sign \
+                      --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+                      --out app/build/outputs/apk/release/app-release-signed.apk "$APK"
+                  /tmp/log_event.sh "sign" "succeeded" "APK signed."
+
+            # ───── 10. Release to GitHub ─────────────────────────────────
+            - name: Release to GitHub
+              if: steps.inspect.outputs.gate_accepted == 'true'
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: build-${{ env.JOB_ID }}
+                  name: SAMP Build ${{ env.JOB_ID }}
+                  files: ${{ steps.inspect.outputs.android_root }}/app/build/outputs/apk/release/app-release-signed.apk
+                  fail_on_unmatched_files: true
+              env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+
+            - name: Mark job succeeded
+              if: success() && steps.inspect.outputs.gate_accepted == 'true'
+              env:
+                  SUPABASE_URL: ${{ inputs.supabase_url }}
+                  SUPABASE_KEY: ${{ inputs.supabase_key }}
+              run: |
+                  DOWNLOAD_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/build-$JOB_ID/app-release-signed.apk"
+                  curl -sS -X PATCH "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID" \
+                       -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                       -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+                       -d "$(jq -n --arg url "$DOWNLOAD_URL" \
+                            '{status:"succeeded", finished_at:(now|todate), apk_url:$url, current_stage:"done"}')"
+                  /tmp/log_event.sh "done" "succeeded" "Build complete."
+
+            # ───── 11. Finalizer (ALWAYS RUNS) ───────────────────────────
+            # Assembles the transparency report from collected artefacts,
+            # sanitises every log file, uploads {report.json, logs/*} to
+            # Supabase Storage, and writes the canonical build_reports row.
+            # Runs even when prior steps failed so the user always sees a
+            # complete diagnostic.
+            - name: Finalize and upload transparency report
+              if: always()
+              shell: bash
+              env:
+                  SUPABASE_URL: ${{ inputs.supabase_url }}
+                  SUPABASE_KEY: ${{ inputs.supabase_key }}
+              run: |
+                  set +e
+                  STAGE_TIMINGS_RAW="$(test -f /tmp/samp-stage-timings/timeline.log && cat /tmp/samp-stage-timings/timeline.log || echo '')"
+                  PROJECT_SPEC_JSON="null"
+                  THREAT_REPORT_JSON="null"
+                  GATE_JSON="null"
+                  if [ -f workdir/project-spec.json ]; then
+                      PROJECT_SPEC_JSON="$(jq -c '.' workdir/project-spec.json 2>/dev/null || echo 'null')"
+                      THREAT_REPORT_JSON="$(jq -c '.threat_report // null' workdir/project-spec.json 2>/dev/null || echo 'null')"
+                      GATE_JSON="$(jq -c '.gate // null' workdir/project-spec.json 2>/dev/null || echo 'null')"
+                  fi
+                  VERDICT="system_error"
+                  if [ "${{ steps.inspect.outputs.gate_accepted }}" = "false" ]; then
+                      VERDICT="rejected"
+                  elif [ "${{ steps.inspect.outputs.gate_accepted }}" = "true" ] && [ "${{ job.status }}" = "success" ]; then
+                      VERDICT="succeeded"
+                  elif [ "${{ steps.inspect.outputs.gate_accepted }}" = "true" ]; then
+                      VERDICT="failed"
+                  fi
+                  REPORT_DIR="/tmp/samp-report"
+                  mkdir -p "$REPORT_DIR/logs"
+                  for raw in /tmp/preflight.log /tmp/bundle-stream.log /tmp/install-stream.log /tmp/gradle-stream.log /tmp/pre-gradle.json /tmp/clone.err /tmp/prebuild.log; do
+                      [ -f "$raw" ] || continue
+                      base="$(basename "$raw")"
+                      pipeline/scripts/sanitize-log.sh "$raw" "$REPORT_DIR/logs/$base"
+                  done
+                  jq -n \
+                      --arg job_id "$JOB_ID" \
+                      --arg verdict "$VERDICT" \
+                      --arg project_type "$PROJECT_TYPE" \
+                      --arg stage_timings "$STAGE_TIMINGS_RAW" \
+                      --argjson project_spec "$PROJECT_SPEC_JSON" \
+                      --argjson threat "$THREAT_REPORT_JSON" \
+                      --argjson gate "$GATE_JSON" \
+                      '{job_id:$job_id, verdict:$verdict, project_type:$project_type,
+                        generated_at:(now|todate),
+                        stage_timings:$stage_timings, project_spec:$project_spec,
+                        threat_report:$threat, gate_decision:$gate}' \
+                      > "$REPORT_DIR/report.json"
+
+                  # Upload to Supabase Storage (best-effort; the strict
+                  # workflow tolerates a missing bucket).
+                  STORAGE_OBJECT_KEY="$JOB_ID/report.json"
+                  PUBLIC_DOWNLOAD_URL=""
+                  UPLOAD_OK=0
+                  if [ -n "${SUPABASE_URL:-}" ]; then
+                      HTTP_CODE=$(curl -sS -o /tmp/upload.out -w '%{http_code}' \
+                          -X PUT "$SUPABASE_URL/storage/v1/object/build-reports/$STORAGE_OBJECT_KEY" \
+                          -H "apikey: $SUPABASE_KEY" \
+                          -H "Authorization: Bearer $SUPABASE_KEY" \
+                          -H "Content-Type: application/json" \
+                          -H "x-upsert: true" \
+                          --data-binary @"$REPORT_DIR/report.json" || echo "000")
+                      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+                          UPLOAD_OK=1
+                          PUBLIC_DOWNLOAD_URL="$SUPABASE_URL/storage/v1/object/public/build-reports/$STORAGE_OBJECT_KEY"
+                          for log_file in "$REPORT_DIR/logs/"*; do
+                              [ -f "$log_file" ] || continue
+                              log_base="$(basename "$log_file")"
+                              curl -sS -o /dev/null \
+                                  -X PUT "$SUPABASE_URL/storage/v1/object/build-reports/$JOB_ID/logs/$log_base" \
+                                  -H "apikey: $SUPABASE_KEY" \
+                                  -H "Authorization: Bearer $SUPABASE_KEY" \
+                                  -H "Content-Type: text/plain" \
+                                  -H "x-upsert: true" \
+                                  --data-binary @"$log_file" || true
+                          done
+                      else
+                          /tmp/log_event.sh "finalize" "warned" "Storage upload returned HTTP $HTTP_CODE; report kept as artifact only."
+                      fi
+                  fi
+
+                  # Persist the canonical build_reports row regardless of
+                  # whether the upload succeeded — the row at least carries
+                  # the verdict and the in-DB JSON copy.
+                  if [ -n "${SUPABASE_URL:-}" ]; then
+                      USER_ID_PAYLOAD="${USER_ID:-}"
+                      if [ -z "$USER_ID_PAYLOAD" ]; then
+                          USER_ID_PAYLOAD=$(curl -sS \
+                              "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID&select=user_id" \
+                              -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                              | jq -r '.[0].user_id // empty')
+                      fi
+                      jq -n \
+                          --arg job_id "$JOB_ID" \
+                          --arg user_id "$USER_ID_PAYLOAD" \
+                          --arg verdict "$VERDICT" \
+                          --argjson project_spec "$PROJECT_SPEC_JSON" \
+                          --argjson threat "$THREAT_REPORT_JSON" \
+                          --argjson gate "$GATE_JSON" \
+                          --arg storage_key "$STORAGE_OBJECT_KEY" \
+                          --arg public_url "$PUBLIC_DOWNLOAD_URL" \
+                          --arg timings "$STAGE_TIMINGS_RAW" \
+                          '{p_job_id:$job_id, p_user_id:$user_id, p_verdict:$verdict,
+                            p_project_spec:$project_spec, p_threat_report:$threat,
+                            p_gate_decision:$gate, p_stage_timings:{timeline:$timings},
+                            p_storage_object_key:$storage_key, p_public_download_url:$public_url,
+                            p_retention_days:30}' \
+                      | curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/reports_create" \
+                          -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                          -H "Content-Type: application/json" --data-binary @- >/dev/null || true
+                  fi
+
+                  # Mark a non-success terminal status if no other step did.
+                  if [ "${{ job.status }}" != "success" ] && [ "${{ steps.inspect.outputs.gate_accepted }}" = "true" ]; then
+                      curl -sS -X PATCH "$SUPABASE_URL/rest/v1/build_jobs?id=eq.$JOB_ID" \
+                           -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                           -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+                           -d '{"status":"failed","finished_at":"'"$(date -u +%FT%TZ)"'","error_kind":"system","error_message":"Your project passed the checks but the build did not finish. Please try the build again in a few minutes."}' || true
+                  fi
+                  /tmp/log_event.sh "finalize" "succeeded" "Transparency report assembled (verdict=$VERDICT, upload_ok=$UPLOAD_OK)."
+
+            - name: Diagnostics archive
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: diagnostics-${{ env.JOB_ID }}
+                  path: |
+                      workdir/project-spec.json
+                      /tmp/samp-report/report.json
+                      /tmp/samp-report/logs/
+                      /tmp/pre-gradle.json
