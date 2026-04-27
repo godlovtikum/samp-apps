@@ -64,11 +64,10 @@ on:
             supabase_key:
                 required: true
                 type: string
-
-  
+  on:
         repository_dispatch:
             types: [build_request]
-        
+    on:
         workflow_dispatch:
             inputs:
                 job_id:
