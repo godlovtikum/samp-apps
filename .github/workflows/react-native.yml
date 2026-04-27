@@ -1,0 +1,29 @@
+# SAMP Apps — Bare React Native build (entry workflow).
+#
+# Triggered by repository_dispatch event_type "build_react_native"
+# fired by supabase/functions/jobs/handlers/create.ts when the user
+# selected "React Native (bare)" in the build form.
+#
+# This file is intentionally a thin router: it forwards every input
+# to _build-shared.yml with `project_type: bare_rn`. The actual
+# pipeline lives in the shared workflow so the three entry files do
+# not drift apart.
+
+name: SAMP Apps · React Native (bare)
+
+on:
+    repository_dispatch:
+        types: [build_react_native]
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        uses: ./.github/workflows/_build-shared.yml
+        with:
+            job_id:       ${{ github.event.client_payload.job_id }}
+            project_repo: ${{ github.event.client_payload.project_repo }}
+            project_ref:  ${{ github.event.client_payload.project_ref || 'main' }}
+            project_type: bare_rn
+            user_id:      ${{ github.event.client_payload.user_id }}

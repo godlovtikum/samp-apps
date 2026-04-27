@@ -1,0 +1,33 @@
+# SAMP Apps — Expo managed build (entry workflow).
+#
+# Triggered by repository_dispatch event_type "build_expo_managed"
+# fired by supabase/functions/jobs/handlers/create.ts when the user
+# selected "Expo (managed)" in the build form.
+#
+# The Expo managed workflow does NOT ship a committed android/
+# directory. The shared pipeline detects `project_type: expo_managed`
+# and runs `npx expo prebuild --platform android` between the install
+# and inspect stages, which generates the android/ tree from the
+# project's app.json. Inspect then sees a real android/ and either
+# accepts (gate passes) or rejects (gate fails) using the same rules
+# as the bare React Native flow.
+
+name: SAMP Apps · Expo (managed)
+
+on:
+    repository_dispatch:
+        types: [build_expo_managed]
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        uses: ./.github/workflows/_build-shared.yml
+        with:
+            job_id:       ${{ github.event.client_payload.job_id }}
+            project_repo: ${{ github.event.client_payload.project_repo }}
+            project_ref:  ${{ github.event.client_payload.project_ref || 'main' }}
+            project_type: expo_managed
+            user_id:      ${{ github.event.client_payload.user_id }}
+        
