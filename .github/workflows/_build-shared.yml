@@ -42,36 +42,70 @@ on:
     workflow_call:
         inputs:
             job_id:
-                description: "Supabase build_jobs.id"
                 required: true
                 type: string
             project_repo:
-                description: "Git URL of the user's project"
                 required: true
                 type: string
             project_ref:
-                description: "Branch / tag / sha"
                 required: false
                 type: string
-                default: "main"
+                default: main
             project_type:
-                description: "bare_rn | expo_managed | expo_prebuild"
                 required: true
                 type: string
             user_id:
-                description: "Supabase users.id (for transparency report attribution)"
                 required: false
                 type: string
                 default: ""
             supabase_url:
-                description: "Supabase project url"
                 required: true
-                type: string 
+                type: string
             supabase_key:
-                description: "Supabase service role key"
                 required: true
-                type: string 
+                type: string
 
+  
+        repository_dispatch:
+            types: [build_request]
+        
+        workflow_dispatch:
+            inputs:
+                job_id:
+                    description: "Supabase build_jobs.id"
+                    required: true
+                    type: string
+                project_repo:
+                    description: "Git URL of the user's project"
+                    required: true
+                    type: string
+                project_ref:
+                    description: "Branch / tag / sha"
+                    required: false
+                    type: string
+                    default: "main"
+                project_type:
+                    description: "Type of project to be compiled"
+                    required: true
+                    type: choice
+                    options:
+                      - "bare_rn"
+                      - "expo_managed"
+                      - "expo_prebuild"
+                user_id:
+                    description: "Supabase users.id (for transparency report attribution)"
+                    required: false
+                    type: string
+                    default: ""
+                supabase_url:
+                    description: "Supabase project url"
+                    required: true
+                    type: string 
+                supabase_key:
+                    description: "Supabase service role key"
+                    required: true
+                    type: string 
+        
 permissions:
     contents: write
 
