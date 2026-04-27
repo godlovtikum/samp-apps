@@ -39,36 +39,7 @@
 name: SAMP Apps · Shared build pipeline
 
 on:
-    workflow_call:
-        inputs:
-            job_id:
-                required: true
-                type: string
-            project_repo:
-                required: true
-                type: string
-            project_ref:
-                required: false
-                type: string
-                default: main
-            project_type:
-                required: true
-                type: string
-            user_id:
-                required: false
-                type: string
-                default: ""
-            supabase_url:
-                required: true
-                type: string
-            supabase_key:
-                required: true
-                type: string
-  on:
-        repository_dispatch:
-            types: [build_request]
-    on:
-        workflow_dispatch:
+    workflow_dispatch:
             inputs:
                 job_id:
                     description: "Supabase build_jobs.id"
