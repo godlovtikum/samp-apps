@@ -1,0 +1,21 @@
+// SAMP sample app — settings.gradle (React Native 0.74.x compatible).
+//
+// React Native 0.75 introduced a new settings-plugin-driven autolinking
+// flow that depends on `com.facebook.react.ReactSettingsExtension`, a
+// class shipped only inside @react-native/gradle-plugin >= 0.75. RN 0.74
+// (and earlier) ship the *legacy* autolinking entry point — a Gradle
+// script that exposes `applyNativeModulesSettingsGradle(settings)` — and
+// that is what this file uses. Mixing the two breaks the build at
+// settings-evaluation time with:
+//   No signature of method: ... extensions.configure() is applicable for
+//   argument types: (java.lang.Class) ...
+//
+// SAMP's strategy + generator detect this exact mismatch dynamically on
+// any user repo and rewrite the settings file the same way before Gradle
+// runs; this sample is the canonical correct shape for RN 0.74.
+rootProject.name = 'SampleRNAndroid'
+
+apply from: file("../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+applyNativeModulesSettingsGradle(settings)
+
+include ':app'

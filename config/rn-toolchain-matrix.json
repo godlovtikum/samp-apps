@@ -1,0 +1,12 @@
+{
+  "_doc": "Maps a React Native minor version (e.g. \"0.74\") to the Android toolchain versions that version of RN expects. Used as a reference when reporting capability mismatches. Add new entries as React Native releases. The 'default' entry is used when the inspected version is unknown.",
+
+  "0.71": { "agp": "7.4.2", "kotlin": "1.7.22", "gradle": "7.6.4", "jdk": "11", "min_sdk": 21, "compile_sdk": 33, "target_sdk": 33, "hermes_default": false },
+  "0.72": { "agp": "7.4.2", "kotlin": "1.8.0",  "gradle": "8.0.1", "jdk": "17", "min_sdk": 21, "compile_sdk": 33, "target_sdk": 33, "hermes_default": true  },
+  "0.73": { "agp": "8.1.1", "kotlin": "1.8.0",  "gradle": "8.3",   "jdk": "17", "min_sdk": 23, "compile_sdk": 34, "target_sdk": 34, "hermes_default": true  },
+  "0.74": { "agp": "8.5.2", "kotlin": "1.9.24", "gradle": "8.7",   "jdk": "17", "min_sdk": 23, "compile_sdk": 34, "target_sdk": 34, "hermes_default": true  },
+  "0.75": { "agp": "8.5.2", "kotlin": "1.9.24", "gradle": "8.8",   "jdk": "17", "min_sdk": 24, "compile_sdk": 34, "target_sdk": 34, "hermes_default": true  },
+  "0.76": { "agp": "8.6.0", "kotlin": "1.9.24", "gradle": "8.10.2","jdk": "17", "min_sdk": 24, "compile_sdk": 35, "target_sdk": 34, "hermes_default": true  },
+
+  "default": { "agp": "8.5.2", "kotlin": "1.9.24", "gradle": "8.7", "jdk": "17", "min_sdk": 23, "compile_sdk": 34, "target_sdk": 34, "hermes_default": true }
+}

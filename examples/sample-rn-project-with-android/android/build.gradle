@@ -1,0 +1,24 @@
+// Top-level build file shared by every sub-project.
+buildscript {
+    ext {
+        buildToolsVersion = "34.0.0"
+        minSdkVersion     = 23
+        compileSdkVersion = 34
+        targetSdkVersion  = 34
+        ndkVersion        = "26.1.10909125"
+        kotlinVersion     = "1.9.24"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.5.2")
+        // The React Native gradle plugin is not published as a stand-alone
+        // maven artifact; it ships inside node_modules/@react-native/gradle-plugin
+        // and is loaded by settings.gradle's pluginManagement.includeBuild(...).
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"

@@ -1,0 +1,27 @@
+{
+    "name": "samp-apps",
+    "version": "2.0.0",
+    "private": true,
+    "description": "SAMP APPS — phone-first, strict-mode build platform that turns React Native repositories with a complete android/ directory into installable Android APKs. Inspect, threat-scan, accept-or-reject. No patching, no shell fallback, no silent fixes.",
+    "license": "MIT",
+    "scripts": {
+        "inspect":        "ts-node inspector/index.ts",
+        "threat-scan":    "ts-node inspector/threatScan.ts",
+        "bundle":         "ts-node builder/metroBundler.ts",
+        "validate":       "ts-node validator/index.ts",
+        "pre-gradle":     "ts-node pipeline/preGradleHealth.ts",
+        "test:e2e:dry":   "ts-node inspector/index.ts ./examples/sample-rn-project-with-android ./.project-spec.json && ts-node validator/index.ts ./examples/sample-rn-project-with-android/android --no-bundle"
+    },
+    "dependencies": {
+        "@babel/parser":   "^7.25.0",
+        "@babel/traverse": "^7.25.0",
+        "@babel/types":    "^7.25.0"
+    },
+    "devDependencies": {
+        "@types/babel__traverse": "^7.20.6",
+        "@types/node":            "^20.14.0",
+        "js-yaml":                "^4.1.1",
+        "ts-node":                "^10.9.2",
+        "typescript":             "~5.9.2"
+    }
+}

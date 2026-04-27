@@ -1,0 +1,17 @@
+[build]
+  publish = "public"
+  functions = "functions"
+
+[functions]
+  node_bundler = "esbuild"
+  included_files = ["functions/_shared/**"]
+
+# Friendly URLs
+[[redirects]]
+  from   = "/api/auth"
+  to     = "/.netlify/functions/auth"
+  status = 200
+[[redirects]]
+  from   = "/api/jobs"
+  to     = "/.netlify/functions/jobs"
+  status = 200

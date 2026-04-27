@@ -1,0 +1,33 @@
+# SAMP Apps — Expo with committed prebuild output (entry workflow).
+#
+# Triggered by repository_dispatch event_type "build_expo_prebuild"
+# fired by supabase/functions/jobs/handlers/create.ts when the user
+# selected "Expo (prebuild committed)" in the build form.
+#
+# This path is for Expo projects whose author has already run
+# `npx expo prebuild --platform android` locally and committed the
+# resulting android/ directory to the repository. From the pipeline's
+# perspective the project is indistinguishable from a bare React
+# Native project — the only reason for a separate entry workflow is
+# transparency: the build_jobs row records `project_type:
+# expo_prebuild` so users (and the public report) can see what the
+# author intended.
+
+name: SAMP Apps · Expo (prebuild committed)
+
+on:
+    repository_dispatch:
+        types: [build_expo_prebuild]
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        uses: ./.github/workflows/_build-shared.yml
+        with:
+            job_id:       ${{ github.event.client_payload.job_id }}
+            project_repo: ${{ github.event.client_payload.project_repo }}
+            project_ref:  ${{ github.event.client_payload.project_ref || 'main' }}
+            project_type: expo_prebuild
+            user_id:      ${{ github.event.client_payload.user_id }}

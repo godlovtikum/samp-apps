@@ -1,0 +1,18 @@
+{
+    "expo": {
+        "name": "SAMP Expo Demo",
+        "slug": "samp-expo-demo",
+        "version": "1.0.0",
+        "orientation": "portrait",
+        "userInterfaceStyle": "automatic",
+        "newArchEnabled": false,
+        "android": {
+            "package": "com.example.sampexpodemo",
+            "versionCode": 1,
+            "adaptiveIcon": {
+                "backgroundColor": "#0b0d10"
+            }
+        },
+        "plugins": []
+    }
+}
